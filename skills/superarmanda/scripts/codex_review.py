@@ -13,7 +13,7 @@ import selectors
 import signal
 import subprocess
 import time
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 
 MODEL = "gpt-6-astra"
@@ -25,6 +25,9 @@ MAX_INPUT = 6 * MAX_PROMPT + 64 * 1024
 MAX_LINE = 1024 * 1024
 MAX_STREAM_BYTES = 8 * 1024 * 1024
 MAX_EVENTS = 4096
+# How long to keep reading after a candidate idle status before treating
+# silence as turn completion (never past the overall deadline).
+IDLE_GRACE_SECONDS = 5.0
 DISABLED_FEATURES = (
     "shell_tool",
     "unified_exec",
@@ -271,16 +274,30 @@ class _Server:
                 pass
         return ident
 
-    def receive(self):
+    def _read_line(self, end):
+        """Read one message, waiting until `end` (capped at self.deadline).
+
+        Reaching `end` while the overall deadline is still ahead returns
+        None (silence); reaching the overall deadline always fails timeout.
+        A partial line already in `self.buffer` is never reported as
+        silence: once bytes without a trailing newline have arrived, only
+        the overall deadline (not `end`) may end this read.
+        """
         while b"\n" not in self.buffer:
-            remaining = self.deadline - time.monotonic()
+            partial = bool(self.buffer)
+            boundary = self.deadline if partial else min(end, self.deadline)
+            remaining = boundary - time.monotonic()
             if remaining <= 0:
-                _fail("timeout")
+                if partial or time.monotonic() >= self.deadline:
+                    _fail("timeout")
+                return None
             selected = selectors.DefaultSelector()
             try:
                 selected.register(self.process.stdout, selectors.EVENT_READ)
                 if not selected.select(remaining):
-                    _fail("timeout")
+                    if partial or time.monotonic() >= self.deadline:
+                        _fail("timeout")
+                    return None
                 chunk = os.read(self.process.stdout.fileno(), 65536)
             finally:
                 selected.close()
@@ -304,6 +321,13 @@ class _Server:
             _fail("protocol")
         return message
 
+    def receive(self):
+        return self._read_line(self.deadline)
+
+    def receive_grace(self, end):
+        """Bounded read for the post-idle grace window; None means silence."""
+        return self._read_line(end)
+
     def request(self, method, params):
         ident = self.send(method, params)
         while True:
@@ -322,6 +346,10 @@ class _Server:
     def event(self):
         return self.pending.popleft() if self.pending else self.receive()
 
+    def event_grace(self, end):
+        """Pending-aware grace read: drain queued events before bounding on `end`."""
+        return self.pending.popleft() if self.pending else self.receive_grace(end)
+
 
 def _reject_event(message, thread_id=None, turn_id=None):
     method = message.get("method")
@@ -339,6 +367,7 @@ def _reject_event(message, thread_id=None, turn_id=None):
         "turn/completed",
         "thread/started",
         "thread/status/changed",
+        "thread/settings/updated",
         "thread/tokenUsage/updated",
         "account/updated",
         "account/rateLimits/updated",
@@ -383,6 +412,23 @@ def _reject_event(message, thread_id=None, turn_id=None):
                 isinstance(thread, dict) and thread.get("id") not in (None, thread_id)
             ):
                 _fail("protocol")
+    if method == "thread/settings/updated":
+        if "threadSettings" in params:
+            settings = params["threadSettings"]
+            if not isinstance(settings, dict):
+                _fail("protocol")
+            _optional_identity(settings)
+            if "sandboxPolicy" in settings:
+                sandbox_policy = settings["sandboxPolicy"]
+                if not isinstance(sandbox_policy, dict):
+                    _fail("protocol")
+                if (
+                    sandbox_policy.get("type") != "readOnly"
+                    or sandbox_policy.get("networkAccess") is not False
+                ):
+                    _fail("identity")
+            if "approvalPolicy" in settings and settings["approvalPolicy"] != "on-request":
+                _fail("identity")
     item = params.get("item")
     if item is not None:
         if not isinstance(item, dict):
@@ -396,6 +442,45 @@ def _reject_event(message, thread_id=None, turn_id=None):
             "reasoning",
         }:
             _fail("execution")
+
+
+def _turn_completed(event, thread_id, turn_id):
+    _reject_event(event, thread_id, turn_id)
+    params = event.get("params")
+    if not isinstance(params, dict) or params.get("threadId") != thread_id:
+        _fail("protocol")
+    final_turn = params.get("turn")
+    if (
+        not isinstance(final_turn, dict)
+        or final_turn.get("id") != turn_id
+        or final_turn.get("status") != "completed"
+    ):
+        _fail("completion")
+    _optional_identity(final_turn)
+    return final_turn
+
+
+def _await_idle_completion(server, thread_id, turn_id):
+    """Grace window after a thread_idle candidate: turn/completed still wins;
+    any further item/turn activity fails closed; silence completes via idle."""
+    grace_end = time.monotonic() + IDLE_GRACE_SECONDS
+    while True:
+        event = server.event_grace(grace_end)
+        if event is None:
+            return {}, "thread_idle"
+        if "id" in event and "method" in event:
+            _fail("execution")
+        method = event.get("method")
+        if method == "turn/completed":
+            return _turn_completed(event, thread_id, turn_id), "turn_completed"
+        _reject_event(event, thread_id, turn_id)
+        if method.startswith("item/") or method == "turn/started":
+            _fail("completion")
+        if method == "thread/status/changed":
+            status = event.get("params", {}).get("status")
+            status_type = status.get("type") if isinstance(status, dict) else None
+            if status_type != "idle":
+                _fail("completion")
 
 
 def _identity(result):
@@ -515,42 +600,67 @@ def run_review(prompt, schema, timeout, env=None, cwd=None):
         turn_id = turn_obj.get("id") if isinstance(turn_obj, dict) else None
         if not isinstance(turn_id, str) or not turn_id:
             _fail("protocol")
-        messages, completed = [], None
+        messages, agent_final = [], []
+        open_ids, open_counts = set(), Counter()
+        turn_started_seen = False
+        completed, completion_kind = None, None
         while completed is None:
             event = server.event()
             if "id" in event and "method" in event:
                 _fail("execution")
             method = event.get("method")
             if method == "turn/completed":
-                _reject_event(event, thread_id, turn_id)
-                params = event.get("params")
-                if not isinstance(params, dict) or params.get("threadId") != thread_id:
-                    _fail("protocol")
-                final_turn = params.get("turn")
-                if (
-                    not isinstance(final_turn, dict)
-                    or final_turn.get("id") != turn_id
-                    or final_turn.get("status") != "completed"
-                ):
-                    _fail("completion")
-                _optional_identity(final_turn)
-                completed = final_turn
+                completed = _turn_completed(event, thread_id, turn_id)
+                completion_kind = "turn_completed"
                 continue
             _reject_event(event, thread_id, turn_id)
-            item = event.get("params", {}).get("item")
-            if (
-                method == "item/completed"
-                and isinstance(item, dict)
-                and str(item.get("type", "")).casefold()
-                in {
-                    "agentmessage",
-                    "agent_message",
-                }
-            ):
-                text = item.get("text")
-                if not isinstance(text, str):
+            params = event.get("params", {})
+            item = params.get("item")
+            if method == "item/started" and isinstance(item, dict):
+                item_id = item.get("id")
+                kind = str(item.get("type", "")).casefold()
+                if item_id is not None:
+                    open_ids.add(item_id)
+                else:
+                    open_counts[kind] += 1
+            elif method == "item/completed" and isinstance(item, dict):
+                item_id = item.get("id")
+                kind = str(item.get("type", "")).casefold()
+                if item_id is not None:
+                    open_ids.discard(item_id)
+                elif open_counts[kind] > 0:
+                    open_counts[kind] -= 1
+                if kind in {"agentmessage", "agent_message"}:
+                    text = item.get("text")
+                    if not isinstance(text, str):
+                        _fail("protocol")
+                    messages.append(text)
+                    agent_final.append(item.get("phase") == "final_answer")
+            elif method == "turn/started":
+                turn = params.get("turn")
+                if params.get("turnId") == turn_id or (
+                    isinstance(turn, dict) and turn.get("id") == turn_id
+                ):
+                    turn_started_seen = True
+            elif method == "thread/status/changed":
+                status = params.get("status")
+                if status is not None and not isinstance(status, dict):
                     _fail("protocol")
-                messages.append(text)
+                status_type = status.get("type") if isinstance(status, dict) else None
+                if (
+                    status_type == "idle"
+                    and turn_started_seen
+                    and params.get("threadId") == thread_id
+                ):
+                    if open_ids or any(open_counts.values()):
+                        _fail("completion")
+                    if len(messages) != 1 or not agent_final[-1]:
+                        _fail("completion")
+                    completed, completion_kind = _await_idle_completion(
+                        server, thread_id, turn_id
+                    )
+                elif status_type != "idle" and turn_started_seen:
+                    _fail("completion")
         if len(messages) != 1:
             _fail("completion")
         response = _json(messages[0])
@@ -574,6 +684,7 @@ def run_review(prompt, schema, timeout, env=None, cwd=None):
             "observed_models": [MODEL],
             "auth": subscription,
             "usage": safe_usage,
+            "completion": completion_kind,
         }
     finally:
         server.close()

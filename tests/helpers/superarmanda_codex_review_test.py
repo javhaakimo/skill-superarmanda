@@ -22,6 +22,45 @@ log=os.environ.get("SA_TEST_LOG") or os.environ["SA_LOG"]
 open(log,"w").write(json.dumps({"program":"codex","kind":"review","argv":sys.argv[1:],"disable_telemetry":os.environ.get("DISABLE_TELEMETRY"),"otel":os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"),"node_tls":os.environ.get("NODE_TLS_REJECT_UNAUTHORIZED")})+"\n")
 def out(x): print(json.dumps(x), flush=True)
 def response(i, result): out({"id":i,"result":result})
+def idle_seq(mode):
+ out({"method":"thread/status/changed","params":{"threadId":"t","status":{"type":"active"}}})
+ if mode=="idle_before_started":
+  out({"method":"thread/status/changed","params":{"threadId":"t","status":{"type":"idle"}}})
+  return
+ if mode=="idle_turn_started_no_id":
+  out({"method":"turn/started","params":{"threadId":"t"}})
+ else:
+  out({"method":"turn/started","params":{"threadId":"t","turnId":"u","turn":{"id":"u"}}})
+ out({"method":"item/started","params":{"threadId":"t","turnId":"u","item":{"type":"userMessage"}}})
+ out({"method":"item/completed","params":{"threadId":"t","turnId":"u","item":{"type":"userMessage"}}})
+ if mode=="idle_open_item":
+  out({"method":"item/started","params":{"threadId":"t","turnId":"u","item":{"type":"reasoning"}}})
+ out({"method":"item/started","params":{"threadId":"t","turnId":"u","item":{"type":"agentMessage"}}})
+ agent_item={"type":"agentMessage","text":json.dumps({"ok":True})}
+ if mode!="idle_no_final_phase":
+  agent_item["phase"]="final_answer"
+ out({"method":"item/completed","params":{"threadId":"t","turnId":"u","item":agent_item}})
+ if mode=="idle_two_agent":
+  extra={"type":"agentMessage","text":json.dumps({"ok":True}),"phase":"final_answer"}
+  out({"method":"item/started","params":{"threadId":"t","turnId":"u","item":{"type":"agentMessage"}}})
+  out({"method":"item/completed","params":{"threadId":"t","turnId":"u","item":extra}})
+ out({"method":"thread/tokenUsage/updated","params":{"threadId":"t","tokenUsage":{}}})
+ out({"method":"account/rateLimits/updated","params":{"rateLimits":{}}})
+ if mode=="idle_system_error":
+  out({"method":"thread/status/changed","params":{"threadId":"t","status":{"type":"systemError"}}})
+  return
+ out({"method":"thread/status/changed","params":{"threadId":"other" if mode=="idle_wrong_thread" else "t","status":{"type":"idle"}}})
+ if mode=="idle_then_completed":
+  out({"method":"turn/completed","params":{"threadId":"t","turn":{"id":"u","status":"completed","usage":{"output_tokens":3}}}})
+ elif mode=="idle_then_failed":
+  out({"method":"turn/completed","params":{"threadId":"t","turn":{"id":"u","status":"failed"}}})
+ elif mode=="idle_then_new_item":
+  out({"method":"item/started","params":{"threadId":"t","turnId":"u","item":{"type":"reasoning"}}})
+ elif mode=="idle_partial_item":
+  payload=json.dumps({"method":"item/started","params":{"threadId":"t","turnId":"u","item":{"type":"reasoning"}}})
+  sys.stdout.write(payload[:10]); sys.stdout.flush()
+  time.sleep(0.4)
+  sys.stdout.write(payload[10:]+"\n"); sys.stdout.flush()
 config={"model_provider":"openai","forced_login_method":"chatgpt","web_search":"disabled","project_doc_max_bytes":0,"orchestrator":{"mcp":{"enabled":False},"skills":{"enabled":False}},"chatgpt_base_url":"https://chatgpt.com/backend-api","features":{"hooks":False,"goals":False,"memories":False,"skill_search":False,"skill_mcp_dependency_install":False,"tool_suggest":False,"sleep_tool":False,"apps":False,"browser_use":False,"browser_use_external":False,"computer_use":False,"image_generation":False,"multi_agent":False,"plugins":False,"remote_plugin":False,"shell_tool":False,"unified_exec":False,"view_image":False,"code_mode":False,"code_mode_host":False},"mcp_servers":{},"notify":[],"hooks":{},"plugins":{},"apps":{},"otel":{"exporter":"none","trace_exporter":"none","metrics_exporter":"none","log_user_prompt":False},"model_providers":{},"model_catalog_json":None,"model_instructions_file":None,"experimental_instructions_file":None,"experimental_thread_store_endpoint":None}
 config["skills"]={"include_instructions":False}
 for line in sys.stdin:
@@ -65,6 +104,16 @@ for line in sys.stdin:
     out({"method":"thread/started","params":started})
    response(i,{"model":"gpt-6-astra","modelProvider":"openai","approvalPolicy":"never" if mode=="approval_policy" else "on-request","sandbox":{"type":"readOnly","networkAccess":False},"thread":{"id":"t","model":"other" if mode=="nested_thread_model" else "gpt-6-astra","modelProvider":"openai"}})
  elif m=="turn/start":
+  if mode in ("idle_completion","settings_bad_sandbox","settings_bad_model","settings_wrong_thread","settings_null_thread_settings","settings_null_sandbox_policy"):
+   settings={"model":"gpt-6-astra","modelProvider":"openai","approvalPolicy":"on-request","sandboxPolicy":{"type":"readOnly","networkAccess":False}}
+   if mode=="settings_bad_sandbox": settings["sandboxPolicy"]={"type":"workspaceWrite","networkAccess":False}
+   if mode=="settings_bad_model": settings["model"]="other-model"
+   if mode=="settings_null_sandbox_policy": settings["sandboxPolicy"]=None
+   payload=None if mode=="settings_null_thread_settings" else settings
+   out({"method":"thread/settings/updated","params":{"threadId":"wrong" if mode=="settings_wrong_thread" else "t","threadSettings":payload}})
+   if mode=="idle_completion": out({"method":"warning","params":{"threadId":"t","message":"synthetic warning"}})
+  if mode.startswith("idle_early_"):
+   idle_seq(mode.replace("idle_early_","idle_",1))
   if mode=="early_wrongid": out({"method":"item/completed","params":{"threadId":"wrong","turnId":"u","item":{"type":"agentMessage","text":"{}"}}})
   if mode=="server_request": out({"id":99,"method":"tool/request","params":{}})
   if mode=="main_server_request": response(i,{"turn":{"id":"u"}}); out({"id":99,"method":"tool/request","params":{}}); continue
@@ -86,6 +135,10 @@ for line in sys.stdin:
   elif mode=="missing_ids":
    out({"method":"item/completed","params":{"item":{"type":"agentMessage","text":"{}"}}})
    out({"method":"turn/completed","params":{"threadId":"t","turn":{"id":"u","status":"completed"}}})
+  elif mode.startswith("idle_early_"):
+   pass
+  elif mode.startswith("idle"):
+   idle_seq(mode)
   else:
    out({"method":"item/started","params":{"threadId":"t","turnId":"u","item":{"type":"userMessage"}}})
    out({"method":"thread/tokenUsage/updated","params":{"threadId":"t","tokenUsage":{}}})
@@ -297,6 +350,88 @@ class Contract(unittest.TestCase):
     def test_early_turn_events_are_replayed_after_turn_start_response(self):
         response, _ = self.invoke("early")
         self.assertEqual(response, {"ok": True})
+
+    def test_idle_completion_without_turn_completed_succeeds(self):
+        previous = adapter.IDLE_GRACE_SECONDS
+        self.addCleanup(setattr, adapter, "IDLE_GRACE_SECONDS", previous)
+        adapter.IDLE_GRACE_SECONDS = 0.2
+        response, meta = self.invoke("idle_completion", timeout=3)
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(meta["usage"], {})
+        self.assertEqual(meta.get("completion"), "thread_idle")
+
+    def test_idle_then_turn_completed_within_grace_succeeds(self):
+        response, meta = self.invoke("idle_then_completed", timeout=3)
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(meta.get("completion"), "turn_completed")
+
+    def test_thread_settings_updated_fail_closed(self):
+        cases = (
+            ("settings_bad_sandbox", "identity"),
+            ("settings_bad_model", "identity"),
+            ("settings_wrong_thread", "protocol"),
+        )
+        for mode, category in cases:
+            with (
+                self.subTest(mode=mode),
+                self.assertRaisesRegex(ValueError, "review CLI failed: " + category),
+            ):
+                self.invoke(mode)
+
+    def test_idle_completion_fail_closed(self):
+        cases = (
+            ("idle_before_started", "timeout"),
+            ("idle_wrong_thread", "protocol"),
+            ("idle_no_final_phase", "completion"),
+            ("idle_two_agent", "completion"),
+            ("idle_open_item", "completion"),
+            ("idle_then_failed", "completion"),
+            ("idle_then_new_item", "completion"),
+            ("idle_system_error", "completion"),
+        )
+        for mode, category in cases:
+            timeout = 0.25 if mode == "idle_before_started" else 5
+            with (
+                self.subTest(mode=mode),
+                self.assertRaisesRegex(ValueError, "review CLI failed: " + category),
+            ):
+                self.invoke(mode, timeout)
+
+    def test_idle_partial_line_at_grace_end_is_not_treated_as_silence(self):
+        previous = adapter.IDLE_GRACE_SECONDS
+        self.addCleanup(setattr, adapter, "IDLE_GRACE_SECONDS", previous)
+        adapter.IDLE_GRACE_SECONDS = 0.15
+        with self.assertRaisesRegex(ValueError, "review CLI failed: completion"):
+            self.invoke("idle_partial_item", timeout=3)
+
+    def test_turn_started_without_ids_does_not_arm_idle_completion(self):
+        previous = adapter.IDLE_GRACE_SECONDS
+        self.addCleanup(setattr, adapter, "IDLE_GRACE_SECONDS", previous)
+        adapter.IDLE_GRACE_SECONDS = 0.05
+        with self.assertRaisesRegex(ValueError, "review CLI failed: timeout"):
+            self.invoke("idle_turn_started_no_id", timeout=0.3)
+
+    def test_null_thread_settings_and_sandbox_policy_fail_closed(self):
+        for mode in ("settings_null_thread_settings", "settings_null_sandbox_policy"):
+            with (
+                self.subTest(mode=mode),
+                self.assertRaisesRegex(ValueError, "review CLI failed: protocol"),
+            ):
+                self.invoke(mode)
+
+    def test_idle_grace_drains_events_queued_before_turn_start_response(self):
+        previous = adapter.IDLE_GRACE_SECONDS
+        self.addCleanup(setattr, adapter, "IDLE_GRACE_SECONDS", previous)
+        adapter.IDLE_GRACE_SECONDS = 0.1
+        for mode in ("idle_early_then_failed", "idle_early_then_new_item"):
+            with (
+                self.subTest(mode=mode),
+                self.assertRaisesRegex(ValueError, "review CLI failed: completion"),
+            ):
+                self.invoke(mode, timeout=3)
+        response, meta = self.invoke("idle_early_then_completed", timeout=3)
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(meta.get("completion"), "turn_completed")
 
 
 if __name__ == "__main__":
