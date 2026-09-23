@@ -54,7 +54,17 @@ The process receives disabling overrides before startup; effective config, exact
 subscription auth and server model/provider are checked before sending the packet.
 Both thread and turn have no environments. Passive metadata notifications are not
 model tool calls; tools, approvals, reroutes and mismatched event IDs fail closed.
+`thread/settings/updated` is accepted only as a passive echo of the already-verified
+model, provider, read-only sandbox and on-request approval; any mismatch fails closed.
 Only one structured answer preceding a matching terminal completion is accepted.
+Terminal completion is `turn/completed`, or, when the server never sends it, a
+`thread/status/changed` idle for our thread: accepted only after `turn/started`,
+with every opened item closed and exactly one `agentMessage` completion whose
+phase is `final_answer`; any earlier idle is ignored, not a completion. Such an
+idle candidate then gets a bounded grace window for a delayed `turn/completed`;
+any further item or turn activity, or a non-idle status change, fails closed
+instead of waiting out the full deadline, and silence past the grace window
+completes the review with `completion: thread_idle` and empty usage.
 Opaque thread/turn IDs and allowlisted usage/capabilities are retained; account
 payloads, configuration and raw server diagnostics are not copied into reports.
 The Astra adapter has a single deadline across setup and inference. A failed call
