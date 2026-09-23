@@ -104,12 +104,16 @@ for line in sys.stdin:
     out({"method":"thread/started","params":started})
    response(i,{"model":"gpt-6-astra","modelProvider":"openai","approvalPolicy":"never" if mode=="approval_policy" else "on-request","sandbox":{"type":"readOnly","networkAccess":False},"thread":{"id":"t","model":"other" if mode=="nested_thread_model" else "gpt-6-astra","modelProvider":"openai"}})
  elif m=="turn/start":
-  if mode in ("idle_completion","settings_bad_sandbox","settings_bad_model","settings_wrong_thread"):
+  if mode in ("idle_completion","settings_bad_sandbox","settings_bad_model","settings_wrong_thread","settings_null_thread_settings","settings_null_sandbox_policy"):
    settings={"model":"gpt-6-astra","modelProvider":"openai","approvalPolicy":"on-request","sandboxPolicy":{"type":"readOnly","networkAccess":False}}
    if mode=="settings_bad_sandbox": settings["sandboxPolicy"]={"type":"workspaceWrite","networkAccess":False}
    if mode=="settings_bad_model": settings["model"]="other-model"
-   out({"method":"thread/settings/updated","params":{"threadId":"wrong" if mode=="settings_wrong_thread" else "t","threadSettings":settings}})
+   if mode=="settings_null_sandbox_policy": settings["sandboxPolicy"]=None
+   payload=None if mode=="settings_null_thread_settings" else settings
+   out({"method":"thread/settings/updated","params":{"threadId":"wrong" if mode=="settings_wrong_thread" else "t","threadSettings":payload}})
    if mode=="idle_completion": out({"method":"warning","params":{"threadId":"t","message":"synthetic warning"}})
+  if mode.startswith("idle_early_"):
+   idle_seq(mode.replace("idle_early_","idle_",1))
   if mode=="early_wrongid": out({"method":"item/completed","params":{"threadId":"wrong","turnId":"u","item":{"type":"agentMessage","text":"{}"}}})
   if mode=="server_request": out({"id":99,"method":"tool/request","params":{}})
   if mode=="main_server_request": response(i,{"turn":{"id":"u"}}); out({"id":99,"method":"tool/request","params":{}}); continue
@@ -131,6 +135,8 @@ for line in sys.stdin:
   elif mode=="missing_ids":
    out({"method":"item/completed","params":{"item":{"type":"agentMessage","text":"{}"}}})
    out({"method":"turn/completed","params":{"threadId":"t","turn":{"id":"u","status":"completed"}}})
+  elif mode.startswith("idle_early_"):
+   pass
   elif mode.startswith("idle"):
    idle_seq(mode)
   else:
@@ -404,6 +410,28 @@ class Contract(unittest.TestCase):
         adapter.IDLE_GRACE_SECONDS = 0.05
         with self.assertRaisesRegex(ValueError, "review CLI failed: timeout"):
             self.invoke("idle_turn_started_no_id", timeout=0.3)
+
+    def test_null_thread_settings_and_sandbox_policy_fail_closed(self):
+        for mode in ("settings_null_thread_settings", "settings_null_sandbox_policy"):
+            with (
+                self.subTest(mode=mode),
+                self.assertRaisesRegex(ValueError, "review CLI failed: protocol"),
+            ):
+                self.invoke(mode)
+
+    def test_idle_grace_drains_events_queued_before_turn_start_response(self):
+        previous = adapter.IDLE_GRACE_SECONDS
+        self.addCleanup(setattr, adapter, "IDLE_GRACE_SECONDS", previous)
+        adapter.IDLE_GRACE_SECONDS = 0.1
+        for mode in ("idle_early_then_failed", "idle_early_then_new_item"):
+            with (
+                self.subTest(mode=mode),
+                self.assertRaisesRegex(ValueError, "review CLI failed: completion"),
+            ):
+                self.invoke(mode, timeout=3)
+        response, meta = self.invoke("idle_early_then_completed", timeout=3)
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(meta.get("completion"), "turn_completed")
 
 
 if __name__ == "__main__":

@@ -346,6 +346,10 @@ class _Server:
     def event(self):
         return self.pending.popleft() if self.pending else self.receive()
 
+    def event_grace(self, end):
+        """Pending-aware grace read: drain queued events before bounding on `end`."""
+        return self.pending.popleft() if self.pending else self.receive_grace(end)
+
 
 def _reject_event(message, thread_id=None, turn_id=None):
     method = message.get("method")
@@ -409,13 +413,13 @@ def _reject_event(message, thread_id=None, turn_id=None):
             ):
                 _fail("protocol")
     if method == "thread/settings/updated":
-        settings = params.get("threadSettings")
-        if settings is not None:
+        if "threadSettings" in params:
+            settings = params["threadSettings"]
             if not isinstance(settings, dict):
                 _fail("protocol")
             _optional_identity(settings)
-            sandbox_policy = settings.get("sandboxPolicy")
-            if sandbox_policy is not None:
+            if "sandboxPolicy" in settings:
+                sandbox_policy = settings["sandboxPolicy"]
                 if not isinstance(sandbox_policy, dict):
                     _fail("protocol")
                 if (
@@ -461,7 +465,7 @@ def _await_idle_completion(server, thread_id, turn_id):
     any further item/turn activity fails closed; silence completes via idle."""
     grace_end = time.monotonic() + IDLE_GRACE_SECONDS
     while True:
-        event = server.receive_grace(grace_end)
+        event = server.event_grace(grace_end)
         if event is None:
             return {}, "thread_idle"
         if "id" in event and "method" in event:
