@@ -365,6 +365,10 @@ def _reject_event(message, thread_id=None, turn_id=None):
         "item/reasoning/summaryDelta",
         "turn/started",
         "turn/completed",
+        # Passive server-side moderation metadata (observed 2026-11 from the
+        # OpenAI backend, independent of CLI version). It is turn-scoped, so the
+        # threadId/turnId checks below still apply; it carries no tool call.
+        "turn/moderationMetadata",
         "thread/started",
         "thread/status/changed",
         "thread/settings/updated",

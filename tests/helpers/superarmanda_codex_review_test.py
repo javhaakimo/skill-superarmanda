@@ -140,6 +140,9 @@ for line in sys.stdin:
   elif mode.startswith("idle"):
    idle_seq(mode)
   else:
+   if mode.startswith("moderation"):
+    mod={"threadId":"other" if mode=="moderation_wrong_thread" else "t","turnId":"other" if mode=="moderation_wrong_turn" else "u","metadata":{"prompt":{"omnimod":{"protection_type":"omnimod","outputs":[]}}}}
+    out({"method":"turn/moderationMetadata","params":mod})
    out({"method":"item/started","params":{"threadId":"t","turnId":"u","item":{"type":"userMessage"}}})
    out({"method":"thread/tokenUsage/updated","params":{"threadId":"t","tokenUsage":{}}})
    out({"method":"account/rateLimits/updated","params":{"rateLimits":{}}})
@@ -364,6 +367,20 @@ class Contract(unittest.TestCase):
         response, meta = self.invoke("idle_then_completed", timeout=3)
         self.assertEqual(response, {"ok": True})
         self.assertEqual(meta.get("completion"), "turn_completed")
+
+    def test_turn_moderation_metadata_is_passive(self):
+        response, meta = self.invoke("moderation")
+        self.assertEqual(response, {"ok": True})
+        self.assertTrue(meta["primary_model_verified"])
+        self.assertTrue(meta["no_execution_tools"])
+
+    def test_turn_moderation_metadata_wrong_ids_fail_closed(self):
+        for mode in ("moderation_wrong_thread", "moderation_wrong_turn"):
+            with (
+                self.subTest(mode=mode),
+                self.assertRaisesRegex(ValueError, "review CLI failed: protocol"),
+            ):
+                self.invoke(mode)
 
     def test_thread_settings_updated_fail_closed(self):
         cases = (
